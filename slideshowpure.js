@@ -24,6 +24,13 @@ const CONFIG = {
   enableTrailers: true,
 };
 
+const INTERNAL = {
+  requestThrottleMs: 100,
+  retainedPastSlides: 1,
+  maxForwardPreload: 2,
+  itemCacheLimit: 12,
+};
+
 // State management
 const STATE = {
   jellyfinData: {
@@ -37,6 +44,8 @@ const STATE = {
   },
   slideshow: {
     hasInitialized: false,
+    dataInitialized: false,
+    localizationInitialized: false,
     isTransitioning: false,
     isPaused: false,
     currentSlideIndex: 0,
@@ -49,9 +58,83 @@ const STATE = {
     totalItems: 0,
     isLoading: false,
     players: {},
+    playerPromises: {},
+    playerStartTimes: {},
     ytPromise: null,
     isMuted: true,
     isVideoPlaying: false,
+    lifecycleState: "uninitialized",
+    isSuspended: false,
+    itemCacheOrder: [],
+    sponsorBlockCache: {},
+    pendingImageRequests: new Set(),
+    currentSlideToken: 0,
+    currentTrailerToken: 0,
+    uiBound: false,
+  },
+};
+
+const RuntimeRegistry = {
+  intervals: new Map(),
+  timeouts: new Map(),
+  listeners: new Map(),
+
+  setInterval(name, callback, interval) {
+    this.clearInterval(name);
+    const id = setInterval(callback, interval);
+    this.intervals.set(name, id);
+    return id;
+  },
+
+  clearInterval(name) {
+    const id = this.intervals.get(name);
+    if (id) {
+      clearInterval(id);
+      this.intervals.delete(name);
+    }
+  },
+
+  setTimeout(name, callback, delay) {
+    this.clearTimeout(name);
+    const id = setTimeout(() => {
+      this.timeouts.delete(name);
+      callback();
+    }, delay);
+    this.timeouts.set(name, id);
+    return id;
+  },
+
+  clearTimeout(name) {
+    const id = this.timeouts.get(name);
+    if (id) {
+      clearTimeout(id);
+      this.timeouts.delete(name);
+    }
+  },
+
+  clearTimeoutsWithPrefix(prefix) {
+    Array.from(this.timeouts.keys())
+      .filter((name) => name.startsWith(prefix))
+      .forEach((name) => this.clearTimeout(name));
+  },
+
+  addListener(name, target, type, handler, options) {
+    this.removeListener(name);
+    target.addEventListener(type, handler, options);
+    this.listeners.set(name, { target, type, handler, options });
+  },
+
+  removeListener(name) {
+    const listener = this.listeners.get(name);
+    if (!listener) {
+      return;
+    }
+    listener.target.removeEventListener(
+      listener.type,
+      listener.handler,
+      listener.options,
+    );
+    this.listeners.delete(name);
   },
 };
 
@@ -78,6 +161,82 @@ const loadYouTubeAPI = () => {
 const requestQueue = [];
 let isProcessingQueue = false;
 
+const isHomeRoute = () =>
+  window.location.hash === "#/home.html" || window.location.hash === "#/home";
+
+const getActiveHomeTab = () => {
+  const activeTab =
+    document.querySelector(".pageTabContent.is-active") ||
+    document.querySelector('.emby-tab-button-active[data-index="0"]');
+
+  if (
+    activeTab &&
+    (activeTab.getAttribute("data-index") === "0" ||
+      activeTab.id === "homeTab" ||
+      activeTab.classList.contains("homeSectionsContainer"))
+  ) {
+    return activeTab;
+  }
+
+  return document.querySelector('.pageTabContent[data-index="0"].is-active');
+};
+
+const hasHomeMountPoint = () =>
+  Boolean(getActiveHomeTab() || document.querySelector(".homeSectionsContainer"));
+
+const isHomeReady = () => isHomeRoute() && hasHomeMountPoint();
+
+const getEffectivePreloadCount = () =>
+  Math.max(1, Math.min(CONFIG.preloadCount || 1, INTERNAL.maxForwardPreload));
+
+const getRetainedIndexes = (currentIndex) => {
+  const totalItems = STATE.slideshow.totalItems;
+  if (!totalItems) {
+    return [];
+  }
+
+  const retained = new Set([currentIndex]);
+  for (let step = 1; step <= INTERNAL.retainedPastSlides; step++) {
+    retained.add((currentIndex - step + totalItems) % totalItems);
+  }
+  for (let step = 1; step <= getEffectivePreloadCount(); step++) {
+    retained.add((currentIndex + step) % totalItems);
+  }
+
+  return Array.from(retained);
+};
+
+const getRetainedItemIds = (currentIndex = STATE.slideshow.currentSlideIndex) =>
+  getRetainedIndexes(currentIndex)
+    .map((index) => STATE.slideshow.itemIds[index])
+    .filter(Boolean);
+
+const isRetainedItem = (itemId) => getRetainedItemIds().includes(itemId);
+
+const cancelPendingSlideWork = () => {
+  RuntimeRegistry.clearTimeout("slide-trailer-start");
+  RuntimeRegistry.clearTimeout("slide-transition-unlock");
+  RuntimeRegistry.clearTimeout("slide-transition-reset");
+  STATE.slideshow.currentTrailerToken += 1;
+};
+
+const getCurrentSlideItemId = () =>
+  STATE.slideshow.itemIds[STATE.slideshow.currentSlideIndex] || null;
+
+const cleanupImageRequests = () => {
+  const validItems = new Set(getRetainedItemIds());
+  for (const key of Array.from(STATE.slideshow.pendingImageRequests)) {
+    const [, itemId] = key.split("::");
+    if (!validItems.has(itemId)) {
+      STATE.slideshow.pendingImageRequests.delete(key);
+    }
+  }
+};
+
+const updateLifecycleState = (state) => {
+  STATE.slideshow.lifecycleState = state;
+};
+
 /**
  * Process the next request in the queue with throttling
  */
@@ -88,7 +247,15 @@ const processNextRequest = () => {
   }
 
   isProcessingQueue = true;
-  const { url, callback } = requestQueue.shift();
+  const { url, callback, shouldProcess, requestKey } = requestQueue.shift();
+
+  if (shouldProcess && !shouldProcess()) {
+    if (requestKey) {
+      STATE.slideshow.pendingImageRequests.delete(requestKey);
+    }
+    setTimeout(processNextRequest, INTERNAL.requestThrottleMs);
+    return;
+  }
 
   fetch(url)
     .then((response) => {
@@ -97,12 +264,19 @@ const processNextRequest = () => {
       }
       throw new Error(`Failed to fetch: ${response.status}`);
     })
-    .then(callback)
+    .then(() => {
+      if (!shouldProcess || shouldProcess()) {
+        callback();
+      }
+    })
     .catch((error) => {
       console.error("Error in throttled request:", error);
     })
     .finally(() => {
-      setTimeout(processNextRequest, 100);
+      if (requestKey) {
+        STATE.slideshow.pendingImageRequests.delete(requestKey);
+      }
+      setTimeout(processNextRequest, INTERNAL.requestThrottleMs);
     });
 };
 
@@ -111,8 +285,17 @@ const processNextRequest = () => {
  * @param {string} url - URL to fetch
  * @param {Function} callback - Callback to run on successful fetch
  */
-const addThrottledRequest = (url, callback) => {
-  requestQueue.push({ url, callback });
+const addThrottledRequest = (url, callback, options = {}) => {
+  const { requestKey = null, shouldProcess = null } = options;
+
+  if (requestKey) {
+    if (STATE.slideshow.pendingImageRequests.has(requestKey)) {
+      return;
+    }
+    STATE.slideshow.pendingImageRequests.add(requestKey);
+  }
+
+  requestQueue.push({ url, callback, shouldProcess, requestKey });
   if (!isProcessingQueue) {
     processNextRequest();
   }
@@ -289,15 +472,83 @@ const initLoadingScreen = () => {
   };
 };
 
+const destroyPlayer = (itemId) => {
+  const player = STATE.slideshow.players[itemId];
+  if (player && typeof player.destroy === "function") {
+    try {
+      player.destroy();
+    } catch (error) {
+      console.warn(`Error destroying player for ${itemId}:`, error);
+    }
+  }
+  delete STATE.slideshow.players[itemId];
+  delete STATE.slideshow.playerPromises[itemId];
+  delete STATE.slideshow.playerStartTimes[itemId];
+};
+
+const pausePlayer = (itemId, resetPosition = false) => {
+  const player = STATE.slideshow.players[itemId];
+  if (!player) {
+    return;
+  }
+
+  try {
+    if (typeof player.pauseVideo === "function") {
+      player.pauseVideo();
+    }
+    if (resetPosition && typeof player.seekTo === "function") {
+      const startTime = STATE.slideshow.playerStartTimes[itemId] || 0;
+      player.seekTo(startTime);
+    }
+  } catch (error) {
+    console.warn(`Failed to pause player for ${itemId}:`, error);
+  }
+};
+
+const suspendSlideshow = () => {
+  if (STATE.slideshow.isSuspended) {
+    return;
+  }
+
+  STATE.slideshow.isSuspended = true;
+  updateLifecycleState("suspended");
+  cancelPendingSlideWork();
+  cleanupImageRequests();
+
+  if (STATE.slideshow.slideInterval) {
+    STATE.slideshow.slideInterval.stop();
+  }
+
+  Object.keys(STATE.slideshow.players).forEach((itemId) => {
+    pausePlayer(itemId, true);
+    destroyPlayer(itemId);
+  });
+
+  const container = document.getElementById("slides-container");
+  if (container) {
+    container.style.display = "none";
+  }
+  STATE.slideshow.isVideoPlaying = false;
+};
+
 /**
  * Resets the slideshow state completely
  */
 const resetSlideshowState = () => {
   console.log("🔄 Resetting slideshow state...");
 
+  suspendSlideshow();
+
   if (STATE.slideshow.slideInterval) {
     STATE.slideshow.slideInterval.stop();
   }
+
+  requestQueue.length = 0;
+  isProcessingQueue = false;
+  STATE.slideshow.pendingImageRequests.clear();
+  RuntimeRegistry.clearTimeoutsWithPrefix("slide-");
+  RuntimeRegistry.clearInterval("home-ready-check");
+  RuntimeRegistry.clearInterval("api-client-check");
 
   const container = document.getElementById("slides-container");
   if (container) {
@@ -307,6 +558,8 @@ const resetSlideshowState = () => {
   }
 
   STATE.slideshow.hasInitialized = false;
+  STATE.slideshow.dataInitialized = false;
+  STATE.slideshow.localizationInitialized = false;
   STATE.slideshow.isTransitioning = false;
   STATE.slideshow.isPaused = false;
   STATE.slideshow.currentSlideIndex = 0;
@@ -315,9 +568,18 @@ const resetSlideshowState = () => {
   STATE.slideshow.slideInterval = null;
   STATE.slideshow.itemIds = [];
   STATE.slideshow.loadedItems = {};
+  STATE.slideshow.itemCacheOrder = [];
   STATE.slideshow.createdSlides = {};
   STATE.slideshow.totalItems = 0;
   STATE.slideshow.isLoading = false;
+  STATE.slideshow.isSuspended = false;
+  STATE.slideshow.lifecycleState = "uninitialized";
+  STATE.slideshow.playerPromises = {};
+  STATE.slideshow.playerStartTimes = {};
+  STATE.slideshow.sponsorBlockCache = {};
+  STATE.slideshow.currentSlideToken = 0;
+  STATE.slideshow.currentTrailerToken = 0;
+  STATE.slideshow.uiBound = false;
 };
 
 /**
@@ -326,17 +588,13 @@ const resetSlideshowState = () => {
 const startLoginStatusWatcher = () => {
   let wasLoggedIn = false;
 
-  setInterval(() => {
+  RuntimeRegistry.setInterval("login-status", () => {
     const isLoggedIn = isUserLoggedIn();
 
     if (isLoggedIn !== wasLoggedIn) {
       if (isLoggedIn) {
-        console.log("👤 User logged in. Initializing slideshow...");
-        if (!STATE.slideshow.hasInitialized) {
-          waitForApiClientAndInitialize();
-        } else {
-          console.log("🔄 Slideshow already initialized, skipping");
-        }
+        console.log("👤 User logged in. Evaluating slideshow lifecycle...");
+        evaluateSlideshowLifecycle();
       } else {
         console.log("👋 User logged out. Stopping slideshow...");
         resetSlideshowState();
@@ -349,47 +607,105 @@ const startLoginStatusWatcher = () => {
 /**
  * Wait for ApiClient to initialize before starting the slideshow
  */
-const waitForApiClientAndInitialize = () => {
-  if (window.slideshowCheckInterval) {
-    clearInterval(window.slideshowCheckInterval);
-  }
-
-  window.slideshowCheckInterval = setInterval(() => {
-    if (!window.ApiClient) {
-      console.log("⏳ ApiClient not available yet. Waiting...");
-      return;
-    }
-
+const ensureJellyfinSession = () =>
+  new Promise((resolve) => {
     if (
+      window.ApiClient &&
       window.ApiClient._currentUser &&
       window.ApiClient._currentUser.Id &&
       window.ApiClient._serverInfo &&
       window.ApiClient._serverInfo.AccessToken
     ) {
-      console.log(
-        "🔓 User is fully logged in. Starting slideshow initialization...",
-      );
-      clearInterval(window.slideshowCheckInterval);
-
-      if (!STATE.slideshow.hasInitialized) {
-        initJellyfinData(async () => {
-          console.log("✅ Jellyfin API client initialized successfully");
-          await initLocalization();
-          await loadYouTubeAPI();
-          slidesInit();
-        });
-      } else {
-        console.log("🔄 Slideshow already initialized, skipping");
-      }
-    } else {
-      console.log(
-        "🔒 Authentication incomplete. Waiting for complete login...",
-      );
+      resolve(true);
+      return;
     }
-  }, CONFIG.retryInterval);
+
+    RuntimeRegistry.setInterval("api-client-check", () => {
+      if (
+        window.ApiClient &&
+        window.ApiClient._currentUser &&
+        window.ApiClient._currentUser.Id &&
+        window.ApiClient._serverInfo &&
+        window.ApiClient._serverInfo.AccessToken
+      ) {
+        RuntimeRegistry.clearInterval("api-client-check");
+        resolve(true);
+      }
+    }, CONFIG.retryInterval);
+  });
+
+const ensureJellyfinDataReady = async () => {
+  await ensureJellyfinSession();
+
+  if (!STATE.slideshow.dataInitialized) {
+    await new Promise((resolve) => {
+      initJellyfinData(() => {
+        STATE.slideshow.dataInitialized = true;
+        resolve();
+      });
+    });
+  }
+
+  if (!STATE.slideshow.localizationInitialized) {
+    await initLocalization();
+    STATE.slideshow.localizationInitialized = true;
+  }
 };
 
-waitForApiClientAndInitialize();
+const resumeSlideshow = async () => {
+  await ensureJellyfinDataReady();
+
+  if (!STATE.slideshow.hasInitialized) {
+    await slidesInit();
+  } else if (!STATE.slideshow.totalItems && !STATE.slideshow.isLoading) {
+    await SlideshowManager.loadSlideshowData();
+  } else if (STATE.slideshow.totalItems) {
+    await SlideshowManager.updateCurrentSlide(STATE.slideshow.currentSlideIndex);
+  }
+
+  STATE.slideshow.isSuspended = false;
+  updateLifecycleState("active");
+
+  const container = document.getElementById("slides-container");
+  if (container) {
+    container.style.display = "block";
+  }
+
+  VisibilityObserver.updateVisibility();
+
+  if (!STATE.slideshow.isPaused && !STATE.slideshow.isVideoPlaying) {
+    STATE.slideshow.slideInterval?.start();
+  }
+};
+
+const scheduleHomeReadyCheck = () => {
+  RuntimeRegistry.setInterval("home-ready-check", () => {
+    if (isHomeReady()) {
+      RuntimeRegistry.clearInterval("home-ready-check");
+      evaluateSlideshowLifecycle();
+    }
+  }, CONFIG.loadingCheckInterval);
+};
+
+const evaluateSlideshowLifecycle = async () => {
+  if (!isUserLoggedIn()) {
+    return;
+  }
+
+  if (!isHomeRoute()) {
+    suspendSlideshow();
+    return;
+  }
+
+  if (!hasHomeMountPoint()) {
+    updateLifecycleState("waiting_for_home");
+    scheduleHomeReadyCheck();
+    return;
+  }
+
+  RuntimeRegistry.clearInterval("home-ready-check");
+  await resumeSlideshow();
+};
 
 /**
  * Utility functions for slide creation and management
@@ -749,6 +1065,23 @@ const LocalizationUtils = {
  * API utilities for fetching data from Jellyfin server
  */
 const ApiUtils = {
+  cacheItemDetails(itemId, itemData) {
+    STATE.slideshow.loadedItems[itemId] = itemData;
+
+    const existingIndex = STATE.slideshow.itemCacheOrder.indexOf(itemId);
+    if (existingIndex !== -1) {
+      STATE.slideshow.itemCacheOrder.splice(existingIndex, 1);
+    }
+    STATE.slideshow.itemCacheOrder.push(itemId);
+
+    while (STATE.slideshow.itemCacheOrder.length > INTERNAL.itemCacheLimit) {
+      const evictedId = STATE.slideshow.itemCacheOrder.shift();
+      if (evictedId && !isRetainedItem(evictedId)) {
+        delete STATE.slideshow.loadedItems[evictedId];
+      }
+    }
+  },
+
   /**
    * Fetches details for a specific item by ID
    * @param {string} itemId - Item ID
@@ -773,7 +1106,7 @@ const ApiUtils = {
 
       const itemData = await response.json();
 
-      STATE.slideshow.loadedItems[itemId] = itemData;
+      this.cacheItemDetails(itemId, itemData);
 
       return itemData;
     } catch (error) {
@@ -788,6 +1121,10 @@ const ApiUtils = {
 
   async getSkipSegments(videoId) {
     try {
+      if (Object.prototype.hasOwnProperty.call(STATE.slideshow.sponsorBlockCache, videoId)) {
+        return STATE.slideshow.sponsorBlockCache[videoId];
+      }
+
       const categories = '["intro","sponsor","selfpromo","interaction"]';
       const response = await fetch(
         `https://sponsor.ajay.app/api/skipSegments?videoID=${videoId}&categories=${categories}`,
@@ -801,11 +1138,15 @@ const ApiUtils = {
           console.log(
             `[SponsorBlock] Skipping intro for ${videoId}. Start at: ${introSegment.segment[1]}`,
           );
-          return Math.ceil(introSegment.segment[1]);
+          const start = Math.ceil(introSegment.segment[1]);
+          STATE.slideshow.sponsorBlockCache[videoId] = start;
+          return start;
         }
       }
+      STATE.slideshow.sponsorBlockCache[videoId] = 0;
       return 0;
     } catch (error) {
+      STATE.slideshow.sponsorBlockCache[videoId] = 0;
       return 0;
     }
   },
@@ -1050,15 +1391,14 @@ const VisibilityObserver = {
   wasVisible: false,
 
   updateVisibility() {
-    const activeTab = document.querySelector(".emby-tab-button-active");
     const container = document.getElementById("slides-container");
 
     if (!container) return;
 
     const isVisible =
-        (window.location.hash === "#/home.html" ||
-         window.location.hash === "#/home") &&
-      activeTab.getAttribute("data-index") === "0";
+      isHomeReady() &&
+      STATE.slideshow.lifecycleState === "active" &&
+      !STATE.slideshow.isSuspended;
 
     container.style.display = isVisible ? "block" : "none";
 
@@ -1094,20 +1434,12 @@ const VisibilityObserver = {
         STATE.slideshow.slideInterval.start();
       }
     } else if (!isVisible && this.wasVisible) {
-      // Transitioning FROM visible TO hidden
       if (STATE.slideshow.slideInterval) {
         STATE.slideshow.slideInterval.stop();
       }
 
       Object.keys(STATE.slideshow.players).forEach((itemId) => {
-        const player = STATE.slideshow.players[itemId];
-        if (player && typeof player.pauseVideo === "function") {
-          try {
-            player.pauseVideo();
-          } catch (e) {
-            console.warn(`Failed to pause player for ${itemId}:`, e);
-          }
-        }
+        pausePlayer(itemId, true);
       });
     }
     this.wasVisible = isVisible;
@@ -1125,11 +1457,18 @@ const VisibilityObserver = {
   },
 
   init() {
-    const observer = new MutationObserver(this.updateVisibility.bind(this));
-    observer.observe(document.body, { childList: true, subtree: true });
-    document.body.addEventListener("click", this.handleClick.bind(this));
-    window.addEventListener("hashchange", this.updateVisibility.bind(this));
-
+    RuntimeRegistry.addListener(
+      "visibility-click",
+      document.body,
+      "click",
+      this.handleClick.bind(this),
+    );
+    RuntimeRegistry.addListener(
+      "visibility-hashchange",
+      window,
+      "hashchange",
+      () => evaluateSlideshowLifecycle(),
+    );
     this.updateVisibility();
   },
 };
@@ -1242,10 +1581,17 @@ const SlideCreator = {
     }
 
     const backdrop = SlideUtils.createElement("img", {
-      className: "backdrop high-quality",
-      src: this.buildImageUrl(item, "Backdrop", 0, serverAddress, 60),
+      className: "backdrop low-quality",
+      src: this.buildImageUrl(item, "Backdrop", 0, serverAddress, 30),
+      "data-high-quality": this.buildImageUrl(
+        item,
+        "Backdrop",
+        0,
+        serverAddress,
+        60,
+      ),
       alt: LocalizationUtils.getLocalizedString("Backdrop", "Backdrop"),
-      loading: "eager",
+      loading: "lazy",
     });
 
     const backdropOverlay = SlideUtils.createElement("div", {
@@ -1258,10 +1604,17 @@ const SlideCreator = {
     backdropContainer.append(backdrop, backdropOverlay);
 
     const logo = SlideUtils.createElement("img", {
-      className: "logo high-quality",
-      src: this.buildImageUrl(item, "Logo", undefined, serverAddress, 40),
+      className: "logo low-quality",
+      src: this.buildImageUrl(item, "Logo", undefined, serverAddress, 20),
+      "data-high-quality": this.buildImageUrl(
+        item,
+        "Logo",
+        undefined,
+        serverAddress,
+        40,
+      ),
       alt: item.Name,
-      loading: "eager",
+      loading: "lazy",
     });
 
     const logoContainer = SlideUtils.createElement("div", {
@@ -1542,71 +1895,6 @@ const SlideCreator = {
       container.appendChild(slide);
       STATE.slideshow.createdSlides[itemId] = true;
 
-      // if (videoId) {
-      //   loadYouTubeAPI().then((YT) => {
-      //     if (!document.getElementById(`trailer-${itemId}`)) return;
-
-      //     STATE.slideshow.players[itemId] = new YT.Player(
-      //       `yt-player-${itemId}`,
-      //       {
-      //         videoId: videoId,
-      //         playerVars: {
-      //           autoplay: 0,
-      //           controls: 0,
-      //           rel: 0,
-      //           fs: 0,
-      //           showinfo: 0,
-      //           modestbranding: 1,
-      //         },
-      //         events: {
-      //           onStateChange: (e) =>
-      //             SlideshowManager.onPlayerStateChange(
-      //               e,
-      //               itemId,
-      //               trailerContainer,
-      //             ),
-      //           onReady: (e) => e.target.mute(),
-      //         },
-      //       },
-      //     );
-      //   });
-      // }
-
-      if (videoId) {
-        const startTime = await ApiUtils.getSkipSegments(videoId);
-
-        loadYouTubeAPI().then((YT) => {
-          if (!document.getElementById(`trailer-${itemId}`)) return;
-
-          STATE.slideshow.players[itemId] = new YT.Player(
-            `yt-player-${itemId}`,
-            {
-              videoId: videoId,
-              playerVars: {
-                autoplay: 0,
-                controls: 0,
-                disablekb: 1,
-                fs: 0,
-                iv_load_policy: 3,
-                modestbranding: 1,
-                rel: 0,
-                showinfo: 0,
-                start: startTime,
-              },
-              events: {
-                onStateChange: (e) =>
-                  SlideshowManager.onPlayerStateChange(
-                    e,
-                    itemId,
-                    trailerContainer,
-                  ),
-                onReady: (e) => e.target.mute(),
-              },
-            },
-          );
-        });
-      }
-
       return slide;
     } catch (error) {
       console.error("Error creating slide for item:", error, itemId);
@@ -1620,13 +1908,14 @@ const SlideCreator = {
  */
 const SlideshowManager = {
   createPaginationDots() {
-    let dotsContainer = document.querySelector(".dots-container");
+    const container = SlideUtils.getOrCreateSlidesContainer();
+    let dotsContainer = container.querySelector(".dots-container");
     if (!dotsContainer) {
       dotsContainer = document.createElement("div");
       dotsContainer.className = "dots-container";
-      document.getElementById("slides-container").appendChild(dotsContainer);
+      container.appendChild(dotsContainer);
     }
-
+    dotsContainer.innerHTML = "";
     for (let i = 0; i < 5; i++) {
       const dot = document.createElement("span");
       dot.className = "dot";
@@ -1636,10 +1925,6 @@ const SlideshowManager = {
     this.updateDots();
   },
 
-  /**
-   * Updates active dot based on current slide
-   * Maps current slide to one of the 5 dots
-   */
   updateDots() {
     const container = SlideUtils.getOrCreateSlidesContainer();
     const dots = container.querySelectorAll(".dot");
@@ -1664,6 +1949,139 @@ const SlideshowManager = {
         dot.classList.remove("active");
       }
     });
+  },
+
+  getTrailerVideoId(itemData) {
+    if (
+      !CONFIG.enableTrailers ||
+      !itemData ||
+      !Array.isArray(itemData.RemoteTrailers) ||
+      itemData.RemoteTrailers.length === 0
+    ) {
+      return null;
+    }
+
+    try {
+      const urlObj = new URL(itemData.RemoteTrailers[0].Url);
+      return urlObj.searchParams.get("v");
+    } catch (error) {
+      return null;
+    }
+  },
+
+  ensurePlayerForItem(itemId, videoId) {
+    if (STATE.slideshow.players[itemId]) {
+      return Promise.resolve(STATE.slideshow.players[itemId]);
+    }
+
+    if (STATE.slideshow.playerPromises[itemId]) {
+      return STATE.slideshow.playerPromises[itemId];
+    }
+
+    const playerPromise = loadYouTubeAPI()
+      .then(async (YT) => {
+        const playerHost = document.getElementById(`yt-player-${itemId}`);
+        const trailerContainer = document.getElementById(`trailer-${itemId}`);
+
+        if (
+          !playerHost ||
+          !trailerContainer ||
+          !isRetainedItem(itemId) ||
+          STATE.slideshow.isSuspended
+        ) {
+          throw new Error(`Trailer host unavailable for ${itemId}`);
+        }
+
+        const startTime = await ApiUtils.getSkipSegments(videoId);
+        if (!isRetainedItem(itemId) || STATE.slideshow.isSuspended) {
+          throw new Error(`Trailer became stale for ${itemId}`);
+        }
+        STATE.slideshow.playerStartTimes[itemId] = startTime;
+
+        return new Promise((resolve, reject) => {
+          try {
+            STATE.slideshow.players[itemId] = new YT.Player(`yt-player-${itemId}`, {
+              videoId,
+              playerVars: {
+                autoplay: 0,
+                controls: 0,
+                disablekb: 1,
+                fs: 0,
+                iv_load_policy: 3,
+                modestbranding: 1,
+                rel: 0,
+                showinfo: 0,
+                start: startTime,
+              },
+              events: {
+                onStateChange: (event) =>
+                  SlideshowManager.onPlayerStateChange(
+                    event,
+                    itemId,
+                    trailerContainer,
+                  ),
+                onReady: (event) => {
+                  event.target.mute();
+                  resolve(event.target);
+                },
+                onError: () => reject(new Error(`YT player failed for ${itemId}`)),
+              },
+            });
+          } catch (error) {
+            reject(error);
+          }
+        });
+      })
+      .finally(() => {
+        delete STATE.slideshow.playerPromises[itemId];
+      });
+
+    STATE.slideshow.playerPromises[itemId] = playerPromise;
+    return playerPromise;
+  },
+
+  async playTrailerForCurrentSlide(slideToken, itemId) {
+    if (
+      STATE.slideshow.currentSlideToken !== slideToken ||
+      STATE.slideshow.isPaused ||
+      STATE.slideshow.isSuspended ||
+      STATE.slideshow.lifecycleState !== "active"
+    ) {
+      return false;
+    }
+
+    const itemData = STATE.slideshow.loadedItems[itemId];
+    const videoId = this.getTrailerVideoId(itemData);
+    if (!videoId) {
+      return false;
+    }
+
+    try {
+      const player = await this.ensurePlayerForItem(itemId, videoId);
+      if (
+        STATE.slideshow.currentSlideToken !== slideToken ||
+        STATE.slideshow.currentSlideIndex >= STATE.slideshow.totalItems ||
+        getCurrentSlideItemId() !== itemId ||
+        !isHomeReady()
+      ) {
+        return false;
+      }
+
+      if (STATE.slideshow.isMuted) {
+        player.mute();
+      } else {
+        player.unMute();
+        player.setVolume(50);
+      }
+
+      player.seekTo(STATE.slideshow.playerStartTimes[itemId] || 0);
+      player.playVideo();
+      return true;
+    } catch (error) {
+      console.warn(`Failed to start trailer for ${itemId}:`, error);
+      destroyPlayer(itemId);
+      return false;
+    }
   },
 
   toggleMute() {
@@ -1693,44 +2111,33 @@ const SlideshowManager = {
    * Updates current slide to the specified index
    * @param {number} index - Slide index to display
    */
-
   async updateCurrentSlide(index) {
-    if (STATE.slideshow.isTransitioning) return;
+    if (STATE.slideshow.isTransitioning || !STATE.slideshow.totalItems) return;
 
-    if (STATE.slideshow.slideInterval) STATE.slideshow.slideInterval.stop();
-
-    const prevItemId =
-      STATE.slideshow.itemIds[STATE.slideshow.currentSlideIndex];
-    if (prevItemId && STATE.slideshow.players[prevItemId]) {
-      try {
-        if (
-          typeof STATE.slideshow.players[prevItemId].pauseVideo === "function"
-        ) {
-          STATE.slideshow.players[prevItemId].pauseVideo();
-          if (
-            typeof STATE.slideshow.players[prevItemId].seekTo === "function"
-          ) {
-            STATE.slideshow.players[prevItemId].seekTo(0);
-          }
-        }
-        STATE.slideshow.isVideoPlaying = false;
-
-        const prevSlide = document.querySelector(
-          `.slide[data-item-id="${prevItemId}"]`,
-        );
-        if (prevSlide) {
-          prevSlide
-            .querySelector(".video-container")
-            ?.classList.remove("active");
-          prevSlide.querySelector(".backdrop")?.classList.remove("with-video");
-          prevSlide
-            .querySelector(".plot-container")
-            ?.classList.remove("with-video");
-        }
-      } catch (e) {}
+    if (STATE.slideshow.slideInterval) {
+      STATE.slideshow.slideInterval.stop();
     }
+    cancelPendingSlideWork();
 
     STATE.slideshow.isTransitioning = true;
+    STATE.slideshow.currentSlideToken += 1;
+    const slideToken = STATE.slideshow.currentSlideToken;
+
+    const prevItemId = getCurrentSlideItemId();
+    if (prevItemId) {
+      pausePlayer(prevItemId, true);
+      STATE.slideshow.isVideoPlaying = false;
+
+      const prevSlide = document.querySelector(
+        `.slide[data-item-id="${prevItemId}"]`,
+      );
+      if (prevSlide) {
+        prevSlide.querySelector(".video-container")?.classList.remove("active");
+        prevSlide.querySelector(".backdrop")?.classList.remove("with-video");
+        prevSlide.querySelector(".plot-container")?.classList.remove("with-video");
+      }
+    }
+
     const container = SlideUtils.getOrCreateSlidesContainer();
     index = Math.max(0, Math.min(index, STATE.slideshow.totalItems - 1));
     const currentItemId = STATE.slideshow.itemIds[index];
@@ -1749,43 +2156,25 @@ const SlideshowManager = {
       currentSlide.querySelector(".backdrop")?.classList.add("animate");
       currentSlide.querySelector(".logo")?.classList.add("animate");
     }
+    this.upgradeSlideImageQuality(currentSlide);
 
     STATE.slideshow.currentSlideIndex = index;
     this.updateDots();
-    this.preloadAdjacentSlides(index);
+    this.pruneSlideCache(index);
+    await this.preloadAdjacentSlides(index);
+    this.pruneSlideCache(index);
 
     const itemData = STATE.slideshow.loadedItems[currentItemId];
-    const hasTrailerData =
-      CONFIG.enableTrailers &&
-      itemData &&
-      itemData.RemoteTrailers &&
-      itemData.RemoteTrailers.length > 0;
+    const hasTrailerData = Boolean(this.getTrailerVideoId(itemData));
 
     if (hasTrailerData) {
-      setTimeout(() => {
-        if (
-          STATE.slideshow.currentSlideIndex === index &&
-          !STATE.slideshow.isPaused
-        ) {
-          const player = STATE.slideshow.players[currentItemId];
-
-          if (player && typeof player.playVideo === "function") {
-            try {
-              if (STATE.slideshow.isMuted) {
-                player.mute();
-              } else {
-                player.unMute();
-                player.setVolume(50);
-              }
-
-              player.seekTo(0);
-              player.playVideo();
-            } catch (e) {
-              fallbackToTimer();
-            }
-          } else {
-            fallbackToTimer();
-          }
+      RuntimeRegistry.setTimeout("slide-trailer-start", async () => {
+        const played = await this.playTrailerForCurrentSlide(
+          slideToken,
+          currentItemId,
+        );
+        if (!played) {
+          fallbackToTimer();
         }
       }, 3500);
     } else {
@@ -1793,19 +2182,23 @@ const SlideshowManager = {
     }
 
     function fallbackToTimer() {
-      if (!STATE.slideshow.isPaused && STATE.slideshow.slideInterval) {
+      if (
+        !STATE.slideshow.isPaused &&
+        !STATE.slideshow.isSuspended &&
+        STATE.slideshow.slideInterval
+      ) {
         STATE.slideshow.slideInterval.restart();
       }
     }
 
-    setTimeout(() => {
+    RuntimeRegistry.setTimeout("slide-transition-reset", () => {
       STATE.slideshow.isTransitioning = false;
       if (prevVisible && CONFIG.slideAnimationEnabled) {
         prevVisible.querySelector(".backdrop")?.classList.remove("animate");
         prevVisible.querySelector(".logo")?.classList.remove("animate");
       }
     }, CONFIG.fadeTransitionDuration);
-    setTimeout(() => {
+    RuntimeRegistry.setTimeout("slide-transition-unlock", () => {
       if (STATE.slideshow.isTransitioning) {
         console.warn("Forcing transition unlock");
         STATE.slideshow.isTransitioning = false;
@@ -1813,55 +2206,61 @@ const SlideshowManager = {
     }, 2000);
   },
 
-  /**
-   * Upgrades the image quality for all images in a slide
-   * @param {HTMLElement} slide - The slide element containing images to upgrade
-   */
-
   upgradeSlideImageQuality(slide) {
     if (!slide) return;
 
+    const itemId = slide.getAttribute("data-item-id");
     const images = slide.querySelectorAll("img.low-quality");
-    images.forEach((img) => {
+    images.forEach((img, index) => {
       const highQualityUrl = img.getAttribute("data-high-quality");
       if (highQualityUrl && img.src !== highQualityUrl) {
-        addThrottledRequest(highQualityUrl, () => {
-          img.src = highQualityUrl;
-          img.classList.remove("low-quality");
-          img.classList.add("high-quality");
-        });
+        const requestKey = `${highQualityUrl}::${itemId}::${index}`;
+        addThrottledRequest(
+          highQualityUrl,
+          () => {
+            img.src = highQualityUrl;
+            img.classList.remove("low-quality");
+            img.classList.add("high-quality");
+          },
+          {
+            requestKey,
+            shouldProcess: () =>
+              Boolean(
+                itemId &&
+                  isRetainedItem(itemId) &&
+                  document.body.contains(img) &&
+                  !STATE.slideshow.isSuspended,
+              ),
+          },
+        );
       }
     });
   },
 
-  /**
-   * Preloads adjacent slides for smoother transitions
-   * @param {number} currentIndex - Current slide index
-   */
   async preloadAdjacentSlides(currentIndex) {
-    const totalItems = STATE.slideshow.totalItems;
-    const preloadCount = CONFIG.preloadCount;
+    const retainedIndexes = getRetainedIndexes(currentIndex).filter(
+      (index) => index !== currentIndex,
+    );
 
-    const nextIndex = (currentIndex + 1) % totalItems;
-    const itemId = STATE.slideshow.itemIds[nextIndex];
-
-    await SlideCreator.createSlideForItemId(itemId);
-
-    if (preloadCount > 1) {
-      const prevIndex = (currentIndex - 1 + totalItems) % totalItems;
-      const prevItemId = STATE.slideshow.itemIds[prevIndex];
-
-      SlideCreator.createSlideForItemId(prevItemId);
+    for (const index of retainedIndexes) {
+      const itemId = STATE.slideshow.itemIds[index];
+      if (!itemId) {
+        continue;
+      }
+      await SlideCreator.createSlideForItemId(itemId);
+      if (!isRetainedItem(itemId)) {
+        this.pruneSlideCache(currentIndex);
+      }
     }
   },
 
   nextSlide() {
-    // if (STATE.slideshow.isVideoPlaying) {
-    //   return;
-    // }
-
     const currentIndex = STATE.slideshow.currentSlideIndex;
     const totalItems = STATE.slideshow.totalItems;
+
+    if (!totalItems) {
+      return;
+    }
 
     const nextIndex = (currentIndex + 1) % totalItems;
 
@@ -1872,57 +2271,48 @@ const SlideshowManager = {
     const currentIndex = STATE.slideshow.currentSlideIndex;
     const totalItems = STATE.slideshow.totalItems;
 
+    if (!totalItems) {
+      return;
+    }
+
     const prevIndex = (currentIndex - 1 + totalItems) % totalItems;
 
     this.updateCurrentSlide(prevIndex);
   },
 
-  /**
-   * Prunes the slide cache to prevent memory bloat
-   * Removes slides that are outside the viewing range
-   */
-  pruneSlideCache() {
-    const currentIndex = STATE.slideshow.currentSlideIndex;
-    const keepRange = 5;
+  pruneSlideCache(currentIndex = STATE.slideshow.currentSlideIndex) {
+    const retainedItemIds = new Set(getRetainedItemIds(currentIndex));
 
     Object.keys(STATE.slideshow.createdSlides).forEach((itemId) => {
-      const index = STATE.slideshow.itemIds.indexOf(itemId);
-      if (index === -1) return;
-
-      const distance = Math.abs(index - currentIndex);
-      if (distance > keepRange) {
-        if (STATE.slideshow.players[itemId]) {
-          try {
-            if (typeof STATE.slideshow.players[itemId].destroy === "function") {
-              STATE.slideshow.players[itemId].destroy();
-            }
-          } catch (e) {
-            console.warn("Error destroying player:", e);
-          }
-          delete STATE.slideshow.players[itemId];
-        }
-
-        delete STATE.slideshow.loadedItems[itemId];
+      if (!retainedItemIds.has(itemId)) {
+        destroyPlayer(itemId);
 
         const slide = document.querySelector(
           `.slide[data-item-id="${itemId}"]`,
         );
-        if (slide) slide.remove();
+        if (slide) {
+          slide.remove();
+        }
 
         delete STATE.slideshow.createdSlides[itemId];
 
-        console.log(`Pruned slide ${itemId} at distance ${distance} from view`);
+        const cacheIndex = STATE.slideshow.itemCacheOrder.indexOf(itemId);
+        if (cacheIndex !== -1) {
+          STATE.slideshow.itemCacheOrder.splice(cacheIndex, 1);
+        }
+        delete STATE.slideshow.loadedItems[itemId];
       }
     });
+
+    cleanupImageRequests();
   },
 
   togglePause() {
     STATE.slideshow.isPaused = !STATE.slideshow.isPaused;
     const pauseButton = document.querySelector(".pause-button");
 
-    const currentId =
-      STATE.slideshow.itemIds[STATE.slideshow.currentSlideIndex];
-    const player = STATE.slideshow.players[currentId];
+    const currentId = getCurrentSlideItemId();
+    const player = currentId ? STATE.slideshow.players[currentId] : null;
 
     if (STATE.slideshow.isPaused) {
       if (STATE.slideshow.slideInterval) STATE.slideshow.slideInterval.stop();
@@ -1935,7 +2325,9 @@ const SlideshowManager = {
         player.pauseVideo();
       }
     } else {
-      if (STATE.slideshow.slideInterval) STATE.slideshow.slideInterval.start();
+      if (!STATE.slideshow.isSuspended && STATE.slideshow.slideInterval) {
+        STATE.slideshow.slideInterval.start();
+      }
       pauseButton.innerHTML = '<i class="material-icons">pause</i>';
       const pauseLabel = LocalizationUtils.getLocalizedString(
         "ButtonPause",
@@ -1950,15 +2342,14 @@ const SlideshowManager = {
     }
   },
 
-  /**
-   * Initializes touch events for swiping
-   */
   initTouchEvents() {
     const container = SlideUtils.getOrCreateSlidesContainer();
     let touchStartX = 0;
     let touchEndX = 0;
 
-    container.addEventListener(
+    RuntimeRegistry.addListener(
+      "touch-start",
+      container,
       "touchstart",
       (e) => {
         touchStartX = e.changedTouches[0].screenX;
@@ -1966,7 +2357,9 @@ const SlideshowManager = {
       { passive: true },
     );
 
-    container.addEventListener(
+    RuntimeRegistry.addListener(
+      "touch-end",
+      container,
       "touchend",
       (e) => {
         touchEndX = e.changedTouches[0].screenX;
@@ -1976,11 +2369,6 @@ const SlideshowManager = {
     );
   },
 
-  /**
-   * Handles swipe gestures
-   * @param {number} startX - Starting X position
-   * @param {number} endX - Ending X position
-   */
   handleSwipe(startX, endX) {
     const diff = endX - startX;
 
@@ -1995,19 +2383,21 @@ const SlideshowManager = {
     }
   },
 
-  /**
-   * Initializes keyboard event listeners
-   */
   initKeyboardEvents() {
-    document.addEventListener("keydown", (e) => {
+    RuntimeRegistry.addListener("keydown", document, "keydown", (e) => {
       if (!STATE.slideshow.containerFocused) {
+        return;
+      }
+
+      const focusElement = document.activeElement;
+      if (!focusElement) {
         return;
       }
 
       switch (e.key) {
         case "ArrowRight":
           if (focusElement.classList.contains("detail-button")) {
-            focusElement.previousElementSibling.focus();
+            focusElement.previousElementSibling?.focus();
           } else {
             SlideshowManager.nextSlide();
           }
@@ -2016,7 +2406,7 @@ const SlideshowManager = {
 
         case "ArrowLeft":
           if (focusElement.classList.contains("play-button")) {
-            focusElement.nextElementSibling.focus();
+            focusElement.nextElementSibling?.focus();
           } else {
             SlideshowManager.prevSlide();
           }
@@ -2029,7 +2419,9 @@ const SlideshowManager = {
           break;
 
         case "Enter":
-          focusElement.click();
+          if (typeof focusElement.click === "function") {
+            focusElement.click();
+          }
           e.preventDefault();
           break;
       }
@@ -2037,11 +2429,11 @@ const SlideshowManager = {
 
     const container = SlideUtils.getOrCreateSlidesContainer();
 
-    container.addEventListener("focus", () => {
+    RuntimeRegistry.addListener("container-focus", container, "focus", () => {
       STATE.slideshow.containerFocused = true;
     });
 
-    container.addEventListener("blur", () => {
+    RuntimeRegistry.addListener("container-blur", container, "blur", () => {
       STATE.slideshow.containerFocused = false;
     });
   },
@@ -2071,12 +2463,12 @@ const SlideshowManager = {
       event.data === YT.PlayerState.CUED
     ) {
       STATE.slideshow.isVideoPlaying = false;
+      if (!STATE.slideshow.isPaused && !STATE.slideshow.isSuspended) {
+        STATE.slideshow.slideInterval?.start();
+      }
     }
   },
 
-  /**
-   * Loads slideshow data and initializes the slideshow
-   */
   async loadSlideshowData() {
     try {
       STATE.slideshow.isLoading = true;
@@ -2092,23 +2484,26 @@ const SlideshowManager = {
       STATE.slideshow.itemIds = itemIds;
       STATE.slideshow.totalItems = itemIds.length;
 
+      if (!itemIds.length) {
+        return;
+      }
+
       this.createPaginationDots();
 
-      STATE.slideshow.slideInterval = new SlideTimer(() => {
-        if (!STATE.slideshow.isPaused && !STATE.slideshow.isVideoPlaying) {
-          this.nextSlide();
-        }
-      }, CONFIG.shuffleInterval);
-
-      STATE.slideshow.slideInterval.stop();
+      if (!STATE.slideshow.slideInterval) {
+        STATE.slideshow.slideInterval = new SlideTimer(() => {
+          if (
+            !STATE.slideshow.isPaused &&
+            !STATE.slideshow.isVideoPlaying &&
+            !STATE.slideshow.isSuspended
+          ) {
+            this.nextSlide();
+          }
+        }, CONFIG.shuffleInterval);
+      }
 
       await this.updateCurrentSlide(0);
-
-      STATE.slideshow.slideInterval = new SlideTimer(() => {
-        if (!STATE.slideshow.isPaused) {
-          this.nextSlide();
-        }
-      }, CONFIG.shuffleInterval);
+      STATE.slideshow.slideInterval.stop();
     } catch (error) {
       console.error("Error loading slideshow data:", error);
     } finally {
@@ -2203,12 +2598,24 @@ const initArrowNavigation = () => {
     }, 300);
   };
 
-  container.addEventListener("mouseenter", showArrows);
+  RuntimeRegistry.addListener(
+    "arrow-mouseenter",
+    container,
+    "mouseenter",
+    showArrows,
+  );
 
-  container.addEventListener("mouseleave", hideArrows);
+  RuntimeRegistry.addListener(
+    "arrow-mouseleave",
+    container,
+    "mouseleave",
+    hideArrows,
+  );
 
   let arrowTimeout;
-  container.addEventListener(
+  RuntimeRegistry.addListener(
+    "arrow-touchstart",
+    container,
     "touchstart",
     () => {
       if (arrowTimeout) {
@@ -2233,94 +2640,19 @@ const slidesInit = async () => {
   }
   STATE.slideshow.hasInitialized = true;
 
-  /**
-   * Initialize IntersectionObserver for lazy loading images
-   */
-  const initLazyLoading = () => {
-    const imageObserver = new IntersectionObserver(
-      (entries, observer) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            const image = entry.target;
-            const highQualityUrl = image.getAttribute("data-high-quality");
-
-            if (
-              highQualityUrl &&
-              image.closest(".slide").style.opacity === "1"
-            ) {
-              requestQueue.push({
-                url: highQualityUrl,
-                callback: () => {
-                  image.src = highQualityUrl;
-                  image.classList.remove("low-quality");
-                  image.classList.add("high-quality");
-                },
-              });
-
-              if (requestQueue.length === 1) {
-                processNextRequest();
-              }
-            }
-
-            observer.unobserve(image);
-          }
-        });
-      },
-      {
-        rootMargin: "50px",
-        threshold: 0.1,
-      },
-    );
-
-    const observeSlideImages = () => {
-      const slides = document.querySelectorAll(".slide");
-      slides.forEach((slide) => {
-        const images = slide.querySelectorAll("img.low-quality");
-        images.forEach((image) => {
-          imageObserver.observe(image);
-        });
-      });
-    };
-
-    const slideObserver = new MutationObserver((mutations) => {
-      mutations.forEach((mutation) => {
-        if (mutation.addedNodes) {
-          mutation.addedNodes.forEach((node) => {
-            if (node.classList && node.classList.contains("slide")) {
-              const images = node.querySelectorAll("img.low-quality");
-              images.forEach((image) => {
-                imageObserver.observe(image);
-              });
-            }
-          });
-        }
-      });
-    });
-
-    const container = SlideUtils.getOrCreateSlidesContainer();
-    slideObserver.observe(container, { childList: true });
-
-    observeSlideImages();
-
-    return imageObserver;
-  };
-
-  const lazyLoadObserver = initLazyLoading();
-
   try {
     console.log("🌟 Initializing Enhanced Jellyfin Slideshow");
 
     await SlideshowManager.loadSlideshowData();
 
-    SlideshowManager.initTouchEvents();
-
-    SlideshowManager.initKeyboardEvents();
-
-    initArrowNavigation();
-
-    initPageVisibilityHandler();
-
-    VisibilityObserver.init();
+    if (!STATE.slideshow.uiBound) {
+      SlideshowManager.initTouchEvents();
+      SlideshowManager.initKeyboardEvents();
+      initArrowNavigation();
+      initPageVisibilityHandler();
+      VisibilityObserver.init();
+      STATE.slideshow.uiBound = true;
+    }
 
     console.log("✅ Enhanced Jellyfin Slideshow initialized successfully");
   } catch (error) {
@@ -2333,57 +2665,13 @@ const slidesInit = async () => {
  * Initialize page visibility handling to pause when tab is inactive
  */
 const initPageVisibilityHandler = () => {
-  let wasVideoPlayingBeforeHide = false;
-
-  document.addEventListener("visibilitychange", () => {
+  RuntimeRegistry.addListener("page-visibility", document, "visibilitychange", () => {
     if (document.hidden) {
       console.log("Tab inactive - pausing slideshow and videos");
-      wasVideoPlayingBeforeHide = STATE.slideshow.isVideoPlaying;
-      if (STATE.slideshow.slideInterval) {
-        STATE.slideshow.slideInterval.stop();
-      }
-      const currentItemId =
-        STATE.slideshow.itemIds[STATE.slideshow.currentSlideIndex];
-      if (currentItemId && STATE.slideshow.players[currentItemId]) {
-        const player = STATE.slideshow.players[currentItemId];
-        if (typeof player.pauseVideo === "function") {
-          try {
-            player.pauseVideo();
-            STATE.slideshow.isVideoPlaying = false;
-          } catch (e) {
-            console.warn("Error pausing video on tab hide:", e);
-          }
-        }
-      }
+      suspendSlideshow();
     } else {
-      console.log("Tab active - resuming slideshow");
-      if (!STATE.slideshow.isPaused) {
-        const currentItemId =
-          STATE.slideshow.itemIds[STATE.slideshow.currentSlideIndex];
-        if (
-          wasVideoPlayingBeforeHide &&
-          currentItemId &&
-          STATE.slideshow.players[currentItemId]
-        ) {
-          const player = STATE.slideshow.players[currentItemId];
-          if (typeof player.playVideo === "function") {
-            try {
-              player.playVideo();
-              STATE.slideshow.isVideoPlaying = true;
-            } catch (e) {
-              console.warn("Error resuming video on tab show:", e);
-              if (STATE.slideshow.slideInterval) {
-                STATE.slideshow.slideInterval.start();
-              }
-            }
-          }
-        } else {
-          if (STATE.slideshow.slideInterval) {
-            STATE.slideshow.slideInterval.start();
-          }
-        }
-        wasVideoPlayingBeforeHide = false;
-      }
+      console.log("Tab active - evaluating slideshow lifecycle");
+      evaluateSlideshowLifecycle();
     }
   });
 };
@@ -2410,3 +2698,4 @@ window.slideshowPure = {
 initLoadingScreen();
 
 startLoginStatusWatcher();
+evaluateSlideshowLifecycle();

@@ -2,7 +2,13 @@
  * Jellyfin Slideshow by M0RPH3US v4.0.4
  */
 
-@import url(https://fonts.googleapis.com/css2?family=Archivo+Narrow:ital,wght@0,400..700;1,400..700&display=swap);
+:root {
+  --media-bar-font-family:
+    "Avenir Next Condensed",
+    "Roboto Condensed",
+    "Arial Narrow",
+    sans-serif;
+}
 
 .backdrop.animate {
   animation:
@@ -534,7 +540,7 @@
   left: 4vw;
   text-align: center;
   color: #fff;
-  font-family: "Archivo Narrow", sans-serif;
+  font-family: var(--media-bar-font-family);
   z-index: 5;
   flex-wrap: wrap;
 }
@@ -556,7 +562,7 @@
   justify-content: center;
   padding: 8px 16px;
   border: solid 0px rgba(255, 255, 255, 0);
-  font-family: "Archivo Narrow", sans-serif;
+  font-family: var(--media-bar-font-family);
   font-size: 18px;
   white-space: nowrap;
   cursor: pointer;
@@ -647,7 +653,7 @@
 }
 
 .misc-info {
-  font-family: "Archivo Narrow", sans-serif;
+  font-family: var(--media-bar-font-family);
   display: flex;
   align-items: center;
   z-index: 5;
@@ -656,7 +662,7 @@
 }
 
 .runTime {
-  font-family: "Archivo Narrow", sans-serif;
+  font-family: var(--media-bar-font-family);
   display: flex;
   align-items: center;
   align-content: center;
@@ -699,7 +705,7 @@
 }
 
 .date {
-  font-family: "Archivo Narrow", sans-serif;
+  font-family: var(--media-bar-font-family);
   font-weight: 500;
   display: flex;
   align-items: center;
